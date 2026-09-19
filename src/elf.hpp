@@ -6,6 +6,7 @@
 #include <cstring>
 #include <elf.h>
 #include <format>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -70,17 +71,46 @@ std::string_view dynsym_name(const Image &img, std::size_t idx);
 std::int64_t sym_index_by_name(const Image &img, std::string_view base);
 
 // ---------------------------------------------------------------------------
+// Dynamic table helpers
+// ---------------------------------------------------------------------------
+// Value of a DT_* tag in `img`'s .dynamic, or nullopt if absent.
+std::optional<u64> dynamic_tag(const Image &img, s64 tag);
+
+// Names of every DT_NEEDED entry in `img`'s .dynamic, in order.
+std::vector<std::string> needed_libraries(const Image &img);
+
+// Decode DT_RELR packed relative relocations into a list of 0-based target
+// virtual addresses (the addresses whose 8-byte value the loader would add the
+// load bias to). Returns empty when the image has no DT_RELR.
+std::vector<u64> relr_targets(const Image &img);
+
+// ---------------------------------------------------------------------------
 // Version needs helpers
 // ---------------------------------------------------------------------------
+struct VersionNeed {
+  std::string file; // owning library (vn_file), e.g. "libstdc++.so.6"
+  std::string name; // version name (vna_name), e.g. "GLIBCXX_3.4.36"
+  u16 index;        // vna_other (the value stored in .gnu.version entries)
+};
+
 struct VersionNeeds {
-  std::vector<std::pair<std::string, u16>> list; // name -> version index
+  std::vector<VersionNeed> list;
 };
 
 VersionNeeds version_needs(const Image &img);
-u16 remap_version(u16 pver, const VersionNeeds &pv, const VersionNeeds &hv);
 
 // lookup a version index by name, or 0 if the image does not need that version
 u16 version_index(const VersionNeeds &vn, std::string_view name);
+
+// Serialize the host's .gnu.version_r with `added` extra (library, version,
+// index) needs appended as new Verneed/Vernaux records. `added` must carry the
+// freshly assigned vna_other indices, grouped by library. Library/version
+// names are appended to `dynstr` and referenced by offset. Returns the merged
+// .gnu.version_r bytes (or an empty vector if neither the host nor `added`
+// contributes any records).
+std::vector<u8> merge_verneed(const Image &host,
+                              const std::vector<VersionNeed> &added,
+                              std::vector<u8> &dynstr);
 
 } // namespace elf
 
@@ -113,12 +143,12 @@ template <> struct std::formatter<elf::VersionNeeds> {
                                  FormatContext &ctx) const {
     auto out = std::format_to(ctx.out(), "VersionNeeds{{");
     bool first = true;
-    for (const auto &[name, idx] : vn.list) {
+    for (const auto &v : vn.list) {
       if (!first) {
         out = std::format_to(out, ", ");
       }
       first = false;
-      out = std::format_to(out, "{}={}", name, idx);
+      out = std::format_to(out, "{}:{}={}", v.file, v.name, v.index);
     }
     return std::format_to(out, "}}");
   }

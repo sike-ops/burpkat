@@ -12,7 +12,8 @@ u32 merge_index(u32 host_idx, u32 symoffset, u32 count) {
 
 Imports build_imports(const elf::Image &host,
                       const std::vector<NewSym> &new_syms,
-                      std::optional<u32> host_pthread_index) {
+                      std::optional<u32> host_pthread_index, u64 bias,
+                      u64 got_slot) {
   Imports im;
 
   const auto di = host.find(".dynsym");
@@ -36,6 +37,13 @@ Imports build_imports(const elf::Image &host,
                    host.fdata() + ssh.sh_offset + ssh.sh_size);
 
   im.dynsym.assign(old_sym, old_sym + nsym);
+  if (bias != 0) {
+    for (auto &s : im.dynsym) {
+      if (s.st_shndx != SHN_UNDEF && s.st_shndx != SHN_ABS) {
+        s.st_value += bias;
+      }
+    }
+  }
   std::vector<u32> name_offs(new_syms.size());
   for (std::size_t i = 0; i < new_syms.size(); ++i) {
     name_offs[i] = static_cast<u32>(im.dynstr.size());
@@ -98,16 +106,22 @@ Imports build_imports(const elf::Image &host,
       sym += im.count;
     }
     r.r_info = ELF64_R_INFO(sym, ELF64_R_TYPE(r.r_info));
+    r.r_offset += bias;
+    if (ELF64_R_TYPE(r.r_info) == R_X86_64_RELATIVE) {
+      r.r_addend += bias;
+    }
   }
 
-  const auto bi = host.find(".bss");
-  check(bi >= 0, "no .bss");
-  im.got_slot = host.shdrs[bi].sh_addr + host.shdrs[bi].sh_size - 8;
-
-  Elf64_Rela pcrel{};
-  pcrel.r_offset = im.got_slot;
-  pcrel.r_info = ELF64_R_INFO(im.pthread_index, R_X86_64_GLOB_DAT);
-  im.rela.push_back(pcrel);
+  // The GOT slot is owned by the caller (an 8-byte scratch slot in the tool's
+  // extra segment). Never carve it out of the host's .bss: that overwrites
+  // host globals at load time.
+  im.got_slot = got_slot;
+  if (got_slot != 0) {
+    Elf64_Rela pcrel{};
+    pcrel.r_offset = im.got_slot;
+    pcrel.r_info = ELF64_R_INFO(im.pthread_index, R_X86_64_GLOB_DAT);
+    im.rela.push_back(pcrel);
+  }
 
   return im;
 }

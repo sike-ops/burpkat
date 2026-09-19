@@ -1,6 +1,7 @@
 #include "elf.hpp"
 #include <algorithm>
 #include <fstream>
+#include <map>
 #include <stdexcept>
 
 namespace elf {
@@ -166,6 +167,92 @@ std::int64_t sym_index_by_name(const Image &img, std::string_view base) {
 }
 
 // ---------------------------------------------------------------------------
+// Dynamic table helpers
+// ---------------------------------------------------------------------------
+std::optional<u64> dynamic_tag(const Image &img, s64 tag) {
+  const auto di = img.find(".dynamic");
+  if (di < 0) {
+    return std::nullopt;
+  }
+  const auto &sh = img.shdrs[di];
+  const u8 *p = img.fdata() + sh.sh_offset;
+  const u8 *end = p + sh.sh_size;
+  while (p + 16 <= end) {
+    s64 t;
+    u64 v;
+    std::memcpy(&t, p, 8);
+    std::memcpy(&v, p + 8, 8);
+    if (t == DT_NULL) {
+      break;
+    }
+    if (t == tag) {
+      return v;
+    }
+    p += 16;
+  }
+  return std::nullopt;
+}
+
+std::vector<std::string> needed_libraries(const Image &img) {
+  std::vector<std::string> out;
+  const auto di = img.find(".dynamic");
+  const auto si = img.find(".dynstr");
+  if (di < 0 || si < 0) {
+    return out;
+  }
+  const auto &dsh = img.shdrs[di];
+  const auto &ssh = img.shdrs[si];
+  const char *str = reinterpret_cast<const char *>(img.fdata() + ssh.sh_offset);
+  const u8 *p = img.fdata() + dsh.sh_offset;
+  const u8 *end = p + dsh.sh_size;
+  while (p + 16 <= end) {
+    s64 tag;
+    u64 val;
+    std::memcpy(&tag, p, 8);
+    std::memcpy(&val, p + 8, 8);
+    if (tag == DT_NULL) {
+      break;
+    }
+    if (tag == DT_NEEDED && val < ssh.sh_size) {
+      out.emplace_back(str + val);
+    }
+    p += 16;
+  }
+  return out;
+}
+
+std::vector<u64> relr_targets(const Image &img) {
+  std::vector<u64> targets;
+  const auto relr = dynamic_tag(img, DT_RELR);
+  const auto relrsz = dynamic_tag(img, DT_RELRSZ);
+  if (!relr || !relrsz || *relrsz == 0) {
+    return targets;
+  }
+  check(*relr + *relrsz <= img.span, "RELR table out of range");
+  const u8 *p = img.vmem.data<u8>() + *relr;
+  const u8 *end = p + *relrsz;
+  u64 where = 0;
+  while (p + 8 <= end) {
+    u64 entry;
+    std::memcpy(&entry, p, 8);
+    p += 8;
+    if ((entry & 1) == 0) {
+      where = entry;
+      targets.push_back(where);
+      where += 8;
+    } else {
+      for (int i = 0; (entry >>= 1) != 0; ++i) {
+        if ((entry & 1) != 0) {
+          targets.push_back(where + 8 * i);
+        }
+      }
+      where += 8 * 63;
+    }
+  }
+  return targets;
+}
+
+// ---------------------------------------------------------------------------
 // Version needs helpers
 // ---------------------------------------------------------------------------
 VersionNeeds version_needs(const Image &img) {
@@ -185,10 +272,11 @@ VersionNeeds version_needs(const Image &img) {
     if (ver->vn_version != 1) {
       break;
     }
+    const char *file = strtab + ver->vn_file;
     const u8 *aux = p + ver->vn_aux;
     for (u16 i = 0; i < ver->vn_cnt; ++i) {
       const auto *vna = reinterpret_cast<const Elf64_Vernaux *>(aux);
-      vn.list.emplace_back(strtab + vna->vna_name, vna->vna_other);
+      vn.list.push_back({file, strtab + vna->vna_name, vna->vna_other});
       if (vna->vna_next == 0) {
         break;
       }
@@ -203,32 +291,129 @@ VersionNeeds version_needs(const Image &img) {
 }
 
 u16 version_index(const VersionNeeds &vn, std::string_view name) {
-  for (const auto &[n, idx] : vn.list) {
-    if (n == name) {
-      return idx;
+  for (const auto &v : vn.list) {
+    if (v.name == name) {
+      return v.index;
     }
   }
   return 0;
 }
 
-u16 remap_version(u16 pver, const VersionNeeds &pv, const VersionNeeds &hv) {
-  if (pver <= 1 || (pver & 0x8000)) {
-    return pver; // local / global / hidden
+namespace {
+
+u32 elf_hash(const char *name) {
+  u32 hash = 0;
+  const auto *p = reinterpret_cast<const u8 *>(name);
+  while (*p != '\0') {
+    u32 hi;
+    hash = (hash << 4) + *p++;
+    hi = hash & 0xf0000000u;
+    if (hi != 0) {
+      hash ^= hi >> 24;
+    }
+    hash &= ~hi;
   }
-  std::string name;
-  for (const auto &[n, idx] : pv.list) {
-    if (idx == pver) {
-      name = n;
-      break;
+  return hash;
+}
+
+} // namespace
+
+std::vector<u8> merge_verneed(const Image &host,
+                              const std::vector<VersionNeed> &added,
+                              std::vector<u8> &dynstr) {
+  std::vector<u8> out;
+  const auto hidx = host.find(".gnu.version_r");
+  if (hidx >= 0) {
+    const auto &sh = host.shdrs[hidx];
+    out.assign(host.fdata() + sh.sh_offset,
+               host.fdata() + sh.sh_offset + sh.sh_size);
+  }
+  if (added.empty()) {
+    return out;
+  }
+
+  // group `added` by owning library, preserving order
+  std::vector<std::pair<std::string, std::vector<const VersionNeed *>>> groups;
+  for (const auto &a : added) {
+    if (groups.empty() || groups.back().first != a.file) {
+      groups.emplace_back(a.file, std::vector<const VersionNeed *>{});
+    }
+    groups.back().second.push_back(&a);
+  }
+
+  // intern strings into dynstr, returning their offset
+  std::map<std::string, u32> str_off;
+  const auto intern = [&](const std::string &s) -> u32 {
+    const auto it = str_off.find(s);
+    if (it != str_off.end()) {
+      return it->second;
+    }
+    const u32 off = static_cast<u32>(dynstr.size());
+    dynstr.insert(dynstr.end(), s.begin(), s.end());
+    dynstr.push_back('\0');
+    str_off.emplace(s, off);
+    return off;
+  };
+
+  // locate the last host Verneed (its vn_next must be patched to point at the
+  // first appended record)
+  std::size_t last = 0;
+  if (!out.empty()) {
+    std::size_t p = 0;
+    while (p + 16 <= out.size()) {
+      const auto *ver = reinterpret_cast<const Elf64_Verneed *>(out.data() + p);
+      if (ver->vn_version != 1) {
+        break;
+      }
+      last = p;
+      if (ver->vn_next == 0) {
+        break;
+      }
+      p += ver->vn_next;
     }
   }
-  check(!name.empty(), "version index not found in payload");
-  for (const auto &[n, idx] : hv.list) {
-    if (n == name) {
-      return idx;
+
+  // record offsets: each group contributes one Verneed + vn_cnt Vernaux
+  const std::size_t base = out.size();
+  std::vector<std::size_t> vn_off(groups.size());
+  std::size_t cursor = base;
+  for (std::size_t g = 0; g < groups.size(); ++g) {
+    vn_off[g] = cursor;
+    cursor += sizeof(Elf64_Verneed) +
+              groups[g].second.size() * sizeof(Elf64_Vernaux);
+  }
+  out.resize(cursor);
+
+  // patch the host's terminating vn_next to the first appended record
+  if (!out.empty() && base != 0) {
+    auto *ver = reinterpret_cast<Elf64_Verneed *>(out.data() + last);
+    ver->vn_next = static_cast<u32>(vn_off[0] - last);
+  }
+
+  for (std::size_t g = 0; g < groups.size(); ++g) {
+    auto &[file, versions] = groups[g];
+    auto *ver = reinterpret_cast<Elf64_Verneed *>(out.data() + vn_off[g]);
+    ver->vn_version = 1;
+    ver->vn_cnt = static_cast<u16>(versions.size());
+    ver->vn_file = intern(file);
+    ver->vn_aux = sizeof(Elf64_Verneed);
+    ver->vn_next =
+        (g + 1 < groups.size()) ? static_cast<u32>(vn_off[g + 1] - vn_off[g])
+                                : 0;
+
+    auto *aux = reinterpret_cast<Elf64_Vernaux *>(out.data() + vn_off[g] +
+                                                  sizeof(Elf64_Verneed));
+    for (std::size_t k = 0; k < versions.size(); ++k) {
+      aux[k].vna_hash = elf_hash(versions[k]->name.c_str());
+      aux[k].vna_flags = 0;
+      aux[k].vna_other = versions[k]->index;
+      aux[k].vna_name = intern(versions[k]->name);
+      aux[k].vna_next =
+          (k + 1 < versions.size()) ? sizeof(Elf64_Vernaux) : 0;
     }
   }
-  fail("payload version not present in host: " + name);
+
+  return out;
 }
 
 } // namespace elf

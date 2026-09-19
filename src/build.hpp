@@ -5,7 +5,7 @@
 
 namespace build {
 
-// Combine a host ET_EXEC with a PIE payload into a single ET_EXEC image.
+// Combine a host (ET_EXEC or PIE) with a PIE payload into a single ET_EXEC.
 std::vector<elf::u8> combine(const elf::Image &host,
                              const elf::Image &payload);
 

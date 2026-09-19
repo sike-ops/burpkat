@@ -43,9 +43,22 @@ u32 merge_index(u32 host_idx, u32 symoffset, u32 count);
 // the host already imports it; the merged GOT slot then resolves against that
 // host symbol (with the host's own version) instead of introducing a duplicate
 // with a guessed version index.
+//
+// `bias` is the host's load bias: 0 for an ET_EXEC host (all addresses are
+// already absolute), or the relocation base chosen for a PIE (ET_DYN) host,
+// whose link-time addresses are 0-based. Every host absolute value emitted
+// into the merged tables (symbol st_value, relocation r_offset/r_addend) is
+// shifted by `bias`.
+//
+// `got_slot` is a caller-provided, writable 8-byte address owned by the tool
+// (in its extra segment) used to hold the resolved pthread_create pointer. It
+// must NOT be carved out of the host's .bss: doing so clobbers the host's
+// globals (thunderbird's uptime guard lives in the last 8 bytes of .bss). The
+// pthread_create GLOB_DAT relocation is only emitted when `got_slot != 0`.
 Imports build_imports(const elf::Image &host,
                       const std::vector<NewSym> &new_syms,
-                      std::optional<u32> host_pthread_index = std::nullopt);
+                      std::optional<u32> host_pthread_index = std::nullopt,
+                      u64 bias = 0, u64 got_slot = 0);
 
 } // namespace imports
 

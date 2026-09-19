@@ -52,20 +52,60 @@ void build_id(std::vector<u8> &out, const elf::Image &host) {
   fail("no NT_GNU_BUILD_ID note found");
 }
 
-void dynamic(std::vector<u8> &out, const elf::Image &host, u64 dynsym_va,
-             u64 dynstr_va, u64 versym_va, u64 gnuhash_va, u64 rela_va,
-             u64 rela_size, u64 jmprel_va, u64 pltrelsz, u64 str_size) {
+std::vector<u8> dynamic(const elf::Image &host, u64 dynsym_va, u64 dynstr_va,
+                        u64 versym_va, u64 gnuhash_va, u64 rela_va,
+                        u64 rela_size, u64 jmprel_va, u64 pltrelsz,
+                        u64 str_size, u64 bias, u64 verneed_va,
+                        u64 verneed_num,
+                        const std::vector<u64> &needed_offsets) {
   const auto di = host.find(".dynamic");
   check(di >= 0, "no .dynamic");
-  const u64 off = host.shdrs[di].sh_offset;
-  const u64 end = off + host.shdrs[di].sh_size;
+  const auto &dsh = host.shdrs[di];
+  const u8 *p = host.fdata() + dsh.sh_offset;
+  const u8 *end = p + dsh.sh_size;
 
-  // first pass: rewrite the pointer entries
-  for (u64 o = off; o + 16 <= end; o += 16) {
+  // Dynamic tags whose d_un.d_ptr is an address and which are not repointed at
+  // the merged tables below. A PIE host stores these 0-based, so they must be
+  // shifted by `bias` to become absolute in the ET_EXEC output.
+  const auto is_addr_tag = [](s64 tag) {
+    switch (tag) {
+    case DT_PLTGOT:
+    case DT_HASH:
+    case DT_REL:
+    case DT_INIT:
+    case DT_FINI:
+    case DT_INIT_ARRAY:
+    case DT_FINI_ARRAY:
+    case DT_PREINIT_ARRAY:
+    case DT_VERDEF:
+    case DT_SYMTAB_SHNDX:
+      return true;
+    default:
+      return false;
+    }
+  };
+
+  std::vector<Elf64_Dyn> entries;
+  const auto emit = [&](s64 tag, u64 val) {
+    Elf64_Dyn d{};
+    d.d_tag = tag;
+    d.d_un.d_val = val;
+    entries.push_back(d);
+  };
+
+  // Rewrite each host entry: repoint the merged tables, force eager binding by
+  // OR-ing DF_BIND_NOW / DF_1_NOW into the flags, and drop DT_RELR. The
+  // terminating DT_NULL is not copied; a fresh one is emitted at the end.
+  bool saw_flags = false;
+  bool saw_flags_1 = false;
+  for (;; p += 16) {
+    if (p + 16 > end) {
+      fail("unterminated .dynamic");
+    }
     s64 tag;
     u64 val;
-    std::memcpy(&tag, out.data() + o, 8);
-    std::memcpy(&val, out.data() + o + 8, 8);
+    std::memcpy(&tag, p, 8);
+    std::memcpy(&val, p + 8, 8);
     if (tag == DT_NULL) {
       break;
     }
@@ -97,31 +137,64 @@ void dynamic(std::vector<u8> &out, const elf::Image &host, u64 dynsym_va,
     case DT_PLTRELSZ:
       val = pltrelsz;
       break;
-    default:
+    case DT_RELR:
+    case DT_RELRSZ:
+      // packed relative relocations were expanded into the merged .rela.dyn;
+      // drop them so the loader does not try to apply them with l_addr == 0
+      val = 0;
       break;
-    }
-    std::memcpy(out.data() + o + 8, &val, 8);
-  }
-
-  // second pass: turn the terminating DT_NULL into DT_FLAGS|DF_BIND_NOW (the
-  // payload's JUMP_SLOT relocations must be resolved eagerly), then append a
-  // fresh DT_NULL.
-  for (u64 o = off; o + 16 <= end; o += 16) {
-    s64 tag;
-    std::memcpy(&tag, out.data() + o, 8);
-    if (tag == DT_NULL) {
-      const u64 flags_tag = DT_FLAGS;
-      const u64 bind_now = DF_BIND_NOW;
-      std::memcpy(out.data() + o, &flags_tag, 8);
-      std::memcpy(out.data() + o + 8, &bind_now, 8);
-      if (o + 16 < end) {
-        const u64 zero = 0;
-        std::memcpy(out.data() + o + 16, &zero, 8);
-        std::memcpy(out.data() + o + 24, &zero, 8);
+    case DT_FLAGS:
+      // bind the payload's JUMP_SLOT relocations eagerly
+      val |= DF_BIND_NOW;
+      saw_flags = true;
+      break;
+    case DT_FLAGS_1:
+      // the output is a fixed-address ET_EXEC, so it is no longer a PIE
+      val &= ~static_cast<u64>(DF_1_PIE);
+      // bind the payload's JUMP_SLOT relocations eagerly
+      val |= DF_1_NOW;
+      saw_flags_1 = true;
+      break;
+    case DT_VERNEED:
+      if (verneed_va != 0) {
+        val = verneed_va;
+      } else {
+        val += bias;
+      }
+      break;
+    case DT_VERNEEDNUM:
+      if (verneed_va != 0) {
+        val = verneed_num;
+      }
+      break;
+    default:
+      if (is_addr_tag(tag)) {
+        val += bias;
       }
       break;
     }
+    emit(tag, val);
   }
+
+  // A host with neither DT_FLAGS nor DT_FLAGS_1 still needs eager binding so the
+  // payload's JUMP_SLOT relocations are applied before the shellcode runs.
+  if (!saw_flags && !saw_flags_1) {
+    emit(DT_FLAGS, DF_BIND_NOW);
+  }
+
+  // DT_NEEDED injection: libraries the payload needs that the host does not
+  // already depend on. Without these the loader would neither load the library
+  // nor be able to bind the appended version needs.
+  for (u64 off : needed_offsets) {
+    logging::debug("injecting DT_NEEDED at dynstr offset {}", off);
+    emit(DT_NEEDED, off);
+  }
+
+  emit(DT_NULL, 0);
+
+  std::vector<u8> out(entries.size() * sizeof(Elf64_Dyn));
+  std::memcpy(out.data(), entries.data(), out.size());
+  return out;
 }
 
 } // namespace patch

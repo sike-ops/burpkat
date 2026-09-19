@@ -16,15 +16,31 @@ struct PayloadReloc {
 };
 
 // Graft + relocate the PIE payload into a flat image at load bias B.
+//
+// `im` is mutated in one place: a payload COPY relocation against a host symbol
+// whose st_size is smaller (typically 0 for a GLOB_DAT import) bumps the merged
+// symbol's size up to the payload's, so the loader copies the full object and
+// does not warn about the size mismatch.
+// `launcher_va` is the runtime address of the payload launcher (see
+// make_launcher). A payload PIE's `_start` calls `__libc_start_main`; that
+// libc entry point runs the *process main map's* constructors, i.e. it would
+// run the host's `.init_array` a second time. The payload's
+// `__libc_start_main` GOT slot is redirected to the launcher instead.
 std::vector<elf::u8> graft_payload(const elf::Image &host,
                                    const elf::Image &payload,
-                                   const imports::Imports &im,
+                                   imports::Imports &im,
                                    const std::vector<imports::NewSym> &new_syms,
-                                   u64 B, PayloadReloc &pr);
+                                   u64 B, u64 launcher_va, PayloadReloc &pr);
 
 // Build the entry shellcode: call the payload, then jump back to the host.
 std::vector<elf::u8> make_shellcode(u64 payload_entry, u64 host_entry,
                                     u64 got_slot);
+
+// Build the payload launcher: entered with rdi = payload main (as passed to
+// __libc_start_main), rsi = argc, rdx = argv. Runs the payload's DT_INIT and
+// each `.init_array` function, then calls main. Never returns (glibc's
+// __libc_start_main would have called exit(); this thread must not).
+std::vector<elf::u8> make_launcher(u64 dt_init, const std::vector<u64> &init_slots);
 
 } // namespace graft
 
